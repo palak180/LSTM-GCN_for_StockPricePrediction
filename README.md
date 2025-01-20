@@ -1,8 +1,4 @@
-Code for the Relational Stock Ranking (RSR) model and the Temporal Graph Convolution in our paper "Temporal Relational Ranking for Stock Prediction", [\[paper\]](https://arxiv.org/abs/1809.09441).
-
-## Environment
-
-Python 3.6 & Tensorflow > 1.3
+Code for "Stock Price Prediction using Temporal Graph Model", [\[paper\]](https://arxiv.org/abs/1809.09441).
 
 ## Data
 
