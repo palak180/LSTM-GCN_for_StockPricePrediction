@@ -55,6 +55,8 @@ def load_graph_relation_data(relation_file, lap=False):
     else:
         return np.dot(np.dot(deg_neg_half_power, ajacent), deg_neg_half_power)
 
+
+
 def train_test_split(eod_tensor, target_tensor, split_ratio=0.8):
     """Splits data into training and testing sets."""
     num_samples = eod_tensor.shape[0]
@@ -81,6 +83,7 @@ def evaluate(model, data_loader, relation_tensor, criterion, device):
 
             predictions = model(eod_data, relation_tensor)
 
+            # Ensure predictions and targets are correctly shaped
             if predictions.shape != targets.shape:
                 targets = targets.view_as(predictions)
 
@@ -89,7 +92,6 @@ def evaluate(model, data_loader, relation_tensor, criterion, device):
 
     avg_loss = total_loss / len(data_loader)
     return avg_loss
-
 
 # LSTM-GCN Model
 class TemporalEncoder(nn.Module):
@@ -117,6 +119,13 @@ class GraphConvolutionalLayer(nn.Module):
         adj: Adjacency matrix with shape [num_nodes, num_nodes]
         """
         batch_size, num_nodes, _ = x.shape
+
+        print(f"Relation Tensor Shape: {adj.shape}")
+
+        # Ensure adjacency matrix has correct dimensions
+        # if adj.dim() == 4:  # Handle extra feature dimension
+        adj = adj.sum(dim=-1)  # Collapse feature dimension
+        print(f"Collapsed Relation Tensor Shape: {adj.shape}")
 
         # Expand adjacency matrix to match batch size
         adj = adj.unsqueeze(0).expand(batch_size, -1, -1)  # Shape: [batch_size, num_nodes, num_nodes]
@@ -197,7 +206,53 @@ def train(model, data_loader, relation_tensor, optimizer, criterion, device):
     avg_loss = total_loss / len(data_loader)
     return avg_loss
 
+def plot_actual_vs_predicted(
+    model, test_loader, relation_tensor, device, ticker_index=0, save_path="actual_vs_predicted_single_ticker.png"
+):
+    """
+    Plots actual vs. predicted targets for a single ticker over timestamps.
 
+    Args:
+        model: Trained model.
+        test_loader: DataLoader for the test set.
+        relation_tensor: Graph relation tensor.
+        device: Device (CPU or GPU) to run the computations.
+        ticker_index: Index of the ticker to plot.
+        save_path: Path to save the plot image.
+    """
+    model.eval()
+    predictions = []
+    actuals = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            eod_data, targets = batch
+            eod_data = eod_data.to(device)
+            relation_tensor = relation_tensor.to(device)
+            targets = targets.to(device)
+
+            # Model predictions
+            preds = model(eod_data, relation_tensor)  # Shape: [batch_size, num_tickers, output_dim]
+
+            # Select the ticker of interest
+            preds = preds[:, ticker_index, :].view(-1).cpu().numpy()
+            actual = targets[:, ticker_index, :].view(-1).cpu().numpy()
+
+            predictions.extend(preds)
+            actuals.extend(actual)
+
+    # Plot actual vs. predicted values for the selected ticker
+    plt.figure(figsize=(12, 6))
+    plt.plot(actuals, label="Actual Targets", color="blue", linewidth=2, alpha=0.7)
+    plt.plot(predictions, label="Predicted Targets", color="orange", linestyle="dashed", linewidth=2, alpha=0.7)
+    plt.xlabel("Timestamps")
+    plt.ylabel("Target Value")
+    plt.title(f"Actual vs Predicted Targets for Ticker {ticker_index}")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+# Adjusted Main Function
 def main():
     # Hyperparameters
     input_dim = 5
@@ -205,25 +260,28 @@ def main():
     gcn_hidden_dim = 32
     output_dim = 1
     learning_rate = 0.001
-    epochs = 20
+    epochs = 10
     batch_size = 32
 
     # Paths
     data_path = r"./data/2013-01-01"
-    relation_file = r"./data/relation/sector_industry/NASDAQ_industry_relation.npy"
-    market_name = "NASDAQ"
-    tickers = np.genfromtxt(r"./data/NASDAQ_tickers_qualify_dr-0.98_min-5_smooth.csv",
+    relation_file = r"./data/relation/sector_industry/NYSE_industry_relation.npy"
+    market_name = "NYSE"
+    tickers = np.genfromtxt(r"./data/NYSE_tickers_qualify_dr-0.98_min-5_smooth.csv",
                              dtype=str, delimiter='\t', skip_header=False)
-
+    print(len(tickers))
     # Load data
     eod_data, _, ground_truth, _ = load_EOD_data(data_path, market_name, tickers)
-    relation_matrix = load_graph_relation_data(relation_file)
+    relation_matrix = np.load(relation_file)  # Assuming this is pre-normalized
+
+    print('original EOD:', eod_data.shape)
 
     # Prepare tensors
     eod_tensor = torch.tensor(eod_data, dtype=torch.float32).permute(1, 0, 2).unsqueeze(2)
-    relation_tensor = torch.tensor(relation_matrix, dtype=torch.float32)  # [num_nodes, num_nodes]
+    relation_tensor = torch.tensor(relation_matrix, dtype=torch.float32)
     target_tensor = torch.tensor(ground_truth, dtype=torch.float32).permute(1, 0).unsqueeze(2)
 
+    # Split data
     (train_eod, train_targets), (test_eod, test_targets) = train_test_split(eod_tensor, target_tensor)
 
     train_dataset = TensorDataset(train_eod, train_targets)
@@ -262,9 +320,12 @@ def main():
     plt.title("Train and Test Loss vs Epochs")
     plt.legend()
     plt.grid(True)
-    # Save the plot as an image file
     plt.savefig("train_test_loss_vs_epochs.png", dpi=300, bbox_inches='tight')
+
+    # Plot Actual vs Predicted Targets
+    plot_actual_vs_predicted(model, test_loader, relation_tensor, device, save_path="actual_vs_predicted.png")
 
 
 if __name__ == "__main__":
     main()
+
