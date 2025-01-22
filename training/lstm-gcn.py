@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
 
+
 # Data Loading Functions 
 def load_EOD_data(data_path, market_name, tickers, steps=1):
     eod_data = []
@@ -70,106 +71,89 @@ def train_test_split(eod_tensor, target_tensor, split_ratio=0.8):
 
     return (train_eod, train_targets), (test_eod, test_targets)
 
-def evaluate(model, data_loader, relation_tensor, criterion, device):
-    """Evaluates the model on a given dataset."""
-    model.eval()
-    total_loss = 0.0
-    with torch.no_grad():
-        for batch in data_loader:
-            eod_data, targets = batch
-            eod_data = eod_data.to(device)
-            relation_tensor = relation_tensor.to(device)
-            targets = targets.to(device)
-
-            predictions = model(eod_data, relation_tensor)
-
-            # Ensure predictions and targets are correctly shaped
-            if predictions.shape != targets.shape:
-                targets = targets.view_as(predictions)
-
-            loss = criterion(predictions, targets)
-            total_loss += loss.item()
-
-    avg_loss = total_loss / len(data_loader)
-    return avg_loss
-
-# LSTM-GCN Model
-class TemporalEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(TemporalEncoder, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-
-    def forward(self, x):
-        print(f"TemporalEncoder Input shape: {x.shape}")
-        lstm_out, (h_n, c_n) = self.lstm(x)
-        print(f"LSTM Output shape: {lstm_out.shape}")
-        print(f"LSTM Hidden State shape: {h_n.shape}")
-        print(f"LSTM Cell State shape: {c_n.shape}")
-        return h_n[-1]
 
 
-class GraphConvolutionalLayer(nn.Module):
+class GCNLayer(nn.Module):
     def __init__(self, in_features, out_features):
-        super(GraphConvolutionalLayer, self).__init__()
-        self.fc = nn.Linear(in_features, out_features)
+        super(GCNLayer, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
 
-    def forward(self, x, adj):
+    def forward(self, features, relation_tensor):
         """
-        x: Node features with shape [batch_size, num_nodes, input_dim]
-        adj: Adjacency matrix with shape [num_nodes, num_nodes]
+        features: [num_nodes, in_features]
+        relation_tensor: [num_nodes, num_nodes]
         """
-        batch_size, num_nodes, _ = x.shape
+        # Normalize adjacency matrix
+        degree = torch.sum(relation_tensor, dim=1).clamp(min=1.0)  # Prevent division by zero
+        norm_relation_tensor = relation_tensor / degree.unsqueeze(1)
 
-        print(f"Relation Tensor Shape: {adj.shape}")
+        print(f"Features shape: {features.shape}")  # Debug print
+        print(f"Relation tensor shape: {relation_tensor.shape}")  # Debug print
+        print(f"Normalized relation tensor shape: {norm_relation_tensor.shape}")  # Debug print
 
-        # Ensure adjacency matrix has correct dimensions
-        # if adj.dim() == 4:  # Handle extra feature dimension
-        adj = adj.sum(dim=-1)  # Collapse feature dimension
-        print(f"Collapsed Relation Tensor Shape: {adj.shape}")
-
-        # Expand adjacency matrix to match batch size
-        adj = adj.unsqueeze(0).expand(batch_size, -1, -1)  # Shape: [batch_size, num_nodes, num_nodes]
-
-        # Perform batched matrix multiplication
-        x = torch.bmm(adj, x)  # Shape: [batch_size, num_nodes, input_dim]
-
-        # Apply the linear transformation
-        x = self.fc(x)  # Shape: [batch_size, num_nodes, out_features]
-
-        return x
+        # Graph convolution
+        aggregated_features = torch.matmul(norm_relation_tensor, features)  # [num_nodes, in_features]
+        updated_features = self.linear(aggregated_features)  # [num_nodes, out_features]
+        return F.relu(updated_features)
 
 
-class LSTM_GCN_Model(nn.Module):
-    def __init__(self, input_dim, lstm_hidden_dim, gcn_hidden_dim, output_dim):
-        super(LSTM_GCN_Model, self).__init__()
-        self.temporal_encoder = TemporalEncoder(input_dim, lstm_hidden_dim)
-        self.graph_conv = GraphConvolutionalLayer(lstm_hidden_dim, gcn_hidden_dim)
-        self.fc = nn.Linear(gcn_hidden_dim, output_dim)
-    
-    def forward(self, x, edge_index):
-        batch_size, num_nodes, num_timesteps, input_dim = x.shape
-        print(f"Forward Input shape: {x.shape}")
-        
-        # LSTM forward pass
-        x_flat = x.view(batch_size * num_nodes, num_timesteps, input_dim)
-        lstm_out = self.temporal_encoder(x_flat)  # [batch_size * num_nodes, lstm_hidden_dim]
-        print(f"LSTM Output shape received in model: {lstm_out.shape}")
-        
-        # Reshape back to [batch_size, num_nodes, lstm_hidden_dim]
-        lstm_out = lstm_out.view(batch_size, num_nodes, -1)
-        
-        # Graph Convolution Layer
-        graph_features = self.graph_conv(lstm_out, edge_index)  # [batch_size, num_nodes, gcn_hidden_dim]
-        print(f"Graph Convolution Output shape: {graph_features.shape}")
-        
-        # Output Layer
-        output = self.fc(graph_features)  # [batch_size, num_nodes, output_dim]
-        print(f"Output shape: {output.shape}")
-        
-        return output
+class GCN_LSTM(nn.Module):
+    def __init__(self, num_nodes, num_features, gcn_hidden_dim, lstm_hidden_dim, output_dim):
+        super(GCN_LSTM, self).__init__()
+        self.gcn_input = GCNLayer(num_features, gcn_hidden_dim)
+        self.gcn_hidden = GCNLayer(lstm_hidden_dim, gcn_hidden_dim)
+        self.gcn_cell = GCNLayer(lstm_hidden_dim, gcn_hidden_dim)
+        self.lstm = nn.LSTM(gcn_hidden_dim, lstm_hidden_dim, batch_first=True)
+        self.fc = nn.Linear(lstm_hidden_dim, output_dim)
 
+    def forward(self, eod_tensor, relation_tensor):
+        """
+        eod_tensor: [num_timesteps, num_nodes, num_features]
+        relation_tensor: [num_nodes, num_nodes]
+        """
+        num_timesteps, num_nodes, num_features = eod_tensor.shape
 
-# Training
+        # Prepare LSTM initial states
+        h_t = torch.zeros(1, 1, self.lstm.hidden_size, device=eod_tensor.device)  # [num_layers, batch_size, lstm_hidden_dim]
+        c_t = torch.zeros(1, 1, self.lstm.hidden_size, device=eod_tensor.device)  # [num_layers, batch_size, lstm_hidden_dim]
+
+        lstm_outputs = []
+
+        for t in range(num_timesteps):
+            # GCN on input features
+            gcn_input_features = self.gcn_input(eod_tensor[t], relation_tensor)  # [num_nodes, gcn_hidden_dim]
+
+            # GCN on hidden state
+            gcn_hidden_state = self.gcn_hidden(h_t.squeeze(0), relation_tensor)  # [num_nodes, gcn_hidden_dim]
+
+            # GCN on cell state
+            gcn_cell_state = self.gcn_cell(c_t.squeeze(0), relation_tensor)  # [num_nodes, gcn_hidden_dim]
+
+            # Combine GCN outputs for input to LSTM
+            combined_features = gcn_input_features  # [num_nodes, gcn_hidden_dim]
+
+            # Aggregate GCN-processed hidden states to match LSTM input
+            lstm_h_t = gcn_hidden_state.mean(dim=0, keepdim=True).unsqueeze(0)  # [1, 1, gcn_hidden_dim]
+            lstm_c_t = gcn_cell_state.mean(dim=0, keepdim=True).unsqueeze(0)  # [1, 1, gcn_hidden_dim]
+
+            # Reshape for LSTM: [batch_size=1, seq_len=num_nodes, input_dim=gcn_hidden_dim]
+            combined_features = combined_features.unsqueeze(0)  # Add batch dimension for LSTM
+
+            print(f"combined_features shape: {combined_features.shape}")
+            print(f"lstm_h_t shape: {lstm_h_t.shape}, lstm_c_t shape: {lstm_c_t.shape}")
+
+            # LSTM step
+            lstm_out, (h_t, c_t) = self.lstm(combined_features, (lstm_h_t, lstm_c_t))
+
+            lstm_outputs.append(lstm_out.squeeze(0))  # Append output for this time step
+
+        # Stack LSTM outputs: [num_timesteps, num_nodes, lstm_hidden_dim]
+        lstm_outputs = torch.stack(lstm_outputs, dim=0)
+
+        # Predict next day's closing prices
+        predictions = self.fc(lstm_outputs[-1])  # Use the last time step's output
+        return predictions
+
 def train(model, data_loader, relation_tensor, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
@@ -180,22 +164,22 @@ def train(model, data_loader, relation_tensor, optimizer, criterion, device):
         relation_tensor = relation_tensor.to(device)  # [num_nodes, num_nodes]
         targets = targets.to(device)  # [batch_size, num_nodes, output_dim]
 
-        print(f"Training batch - eod_data shape: {eod_data.shape}, targets shape: {targets.shape}")
-        
         optimizer.zero_grad()
 
+        # Squeeze the timestep dimension
+        eod_data = eod_data.squeeze(2)  # [batch_size, num_nodes, input_dim]
+        print(f"Relation tensor shape: {relation_tensor.shape}")
+        print(f"eod_data shape after squeeze: {eod_data.shape}")
+
+        # print("EOD_data:", eod_data.shape)
         # Forward pass
         predictions = model(eod_data, relation_tensor)  # [batch_size, num_nodes, output_dim]
 
         # Ensure predictions and targets have the same shape
-        if predictions.shape != targets.shape:
-            targets = targets.view_as(predictions)  # Adjust shape to match predictions
-
-        print(f"Predictions shape: {predictions.shape}")
+        targets = targets.view_as(predictions)  # Adjust shape to match predictions
 
         # Compute loss
         loss = criterion(predictions, targets)
-        print(f"Loss: {loss.item()}")
 
         # Backpropagation and optimization
         loss.backward()
@@ -206,53 +190,63 @@ def train(model, data_loader, relation_tensor, optimizer, criterion, device):
     avg_loss = total_loss / len(data_loader)
     return avg_loss
 
-def plot_actual_vs_predicted(
-    model, test_loader, relation_tensor, device, ticker_index=0, save_path="actual_vs_predicted_single_ticker.png"
-):
-    """
-    Plots actual vs. predicted targets for a single ticker over timestamps.
 
-    Args:
-        model: Trained model.
-        test_loader: DataLoader for the test set.
-        relation_tensor: Graph relation tensor.
-        device: Device (CPU or GPU) to run the computations.
-        ticker_index: Index of the ticker to plot.
-        save_path: Path to save the plot image.
-    """
+def evaluate(model, data_loader, relation_tensor, criterion, device):
     model.eval()
-    predictions = []
-    actuals = []
+    total_loss = 0.0
 
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in data_loader:
+            eod_data, targets = batch  # Unpack batch
+            eod_data = eod_data.to(device)
+            relation_tensor = relation_tensor.to(device)
+            targets = targets.to(device)
+
+            # Forward pass
+            predictions = model(eod_data, relation_tensor)
+
+            # Ensure predictions and targets have the same shape
+            targets = targets.view_as(predictions)
+
+            # Compute loss
+            loss = criterion(predictions, targets)
+            total_loss += loss.item()
+
+    avg_loss = total_loss / len(data_loader)
+    return avg_loss
+
+
+def plot_actual_vs_predicted(model, data_loader, relation_tensor, device, save_path="actual_vs_predicted.png"):
+    model.eval()
+    actuals = []
+    predictions = []
+
+    with torch.no_grad():
+        for batch in data_loader:
             eod_data, targets = batch
             eod_data = eod_data.to(device)
             relation_tensor = relation_tensor.to(device)
             targets = targets.to(device)
 
-            # Model predictions
-            preds = model(eod_data, relation_tensor)  # Shape: [batch_size, num_tickers, output_dim]
+            preds = model(eod_data, relation_tensor)
+            actuals.append(targets.cpu().numpy())
+            predictions.append(preds.cpu().numpy())
 
-            # Select the ticker of interest
-            preds = preds[:, ticker_index, :].view(-1).cpu().numpy()
-            actual = targets[:, ticker_index, :].view(-1).cpu().numpy()
+    actuals = np.concatenate(actuals, axis=0)
+    predictions = np.concatenate(predictions, axis=0)
 
-            predictions.extend(preds)
-            actuals.extend(actual)
-
-    # Plot actual vs. predicted values for the selected ticker
-    plt.figure(figsize=(12, 6))
-    plt.plot(actuals, label="Actual Targets", color="blue", linewidth=2, alpha=0.7)
-    plt.plot(predictions, label="Predicted Targets", color="orange", linestyle="dashed", linewidth=2, alpha=0.7)
-    plt.xlabel("Timestamps")
-    plt.ylabel("Target Value")
-    plt.title(f"Actual vs Predicted Targets for Ticker {ticker_index}")
+    plt.figure(figsize=(10, 6))
+    plt.plot(actuals.flatten(), label="Actual Prices", marker='o')
+    plt.plot(predictions.flatten(), label="Predicted Prices", marker='x')
+    plt.xlabel("Time Steps")
+    plt.ylabel("Closing Prices")
+    plt.title("Actual vs Predicted Closing Prices")
     plt.legend()
     plt.grid(True)
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
 
-# Adjusted Main Function
+
 def main():
     # Hyperparameters
     input_dim = 5
@@ -269,12 +263,13 @@ def main():
     market_name = "NYSE"
     tickers = np.genfromtxt(r"./data/NYSE_tickers_qualify_dr-0.98_min-5_smooth.csv",
                              dtype=str, delimiter='\t', skip_header=False)
-    print(len(tickers))
+    print(f"Number of tickers: {len(tickers)}")
+
     # Load data
     eod_data, _, ground_truth, _ = load_EOD_data(data_path, market_name, tickers)
     relation_matrix = np.load(relation_file)  # Assuming this is pre-normalized
 
-    print('original EOD:', eod_data.shape)
+    print(f"Original EOD shape: {eod_data.shape}")
 
     # Prepare tensors
     eod_tensor = torch.tensor(eod_data, dtype=torch.float32).permute(1, 0, 2).unsqueeze(2)
@@ -284,15 +279,18 @@ def main():
     # Split data
     (train_eod, train_targets), (test_eod, test_targets) = train_test_split(eod_tensor, target_tensor)
 
+    print('train_eod shape:', train_eod.shape)
     train_dataset = TensorDataset(train_eod, train_targets)
     test_dataset = TensorDataset(test_eod, test_targets)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
+    relation_tensor = relation_tensor.sum(dim=-1)
+
     # Model, Optimizer, Loss
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = LSTM_GCN_Model(input_dim, lstm_hidden_dim, gcn_hidden_dim, output_dim).to(device)
+    model = GCN_LSTM(len(tickers), input_dim, gcn_hidden_dim, lstm_hidden_dim, output_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.MSELoss()
 
@@ -301,7 +299,6 @@ def main():
 
     for epoch in range(epochs):
         # Train
-        model.train()
         train_loss = train(model, train_loader, relation_tensor, optimizer, criterion, device)
         train_losses.append(train_loss)
 
@@ -321,6 +318,7 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.savefig("train_test_loss_vs_epochs.png", dpi=300, bbox_inches='tight')
+    plt.show()
 
     # Plot Actual vs Predicted Targets
     plot_actual_vs_predicted(model, test_loader, relation_tensor, device, save_path="actual_vs_predicted.png")
@@ -328,4 +326,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
